@@ -1,3 +1,10 @@
+*.toml
+*.json
+abm
+*.csv
+*.png
+*.pth
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
