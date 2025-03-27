@@ -13,6 +13,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from itertools import product
+import torch.nn.functional as F  # NEW: for one-hot encoding in the forward pass
 
 
 # For the NN version:
@@ -61,7 +62,7 @@ S_DISCRETIZATION = 0.02  # Ideally read from config.toml
 I_DISCRETIZATION = 0.01  # Ideally read from config.toml
 
 # Intervention values
-INTERVENTION_VALUES = [0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+INTERVENTION_VALUES = [0.0, 0.5, 0.75, 0.9]
 NUM_ACTIONS = len(INTERVENTION_VALUES) ** 2
 
 # Learning hyperparameters
@@ -85,6 +86,7 @@ S_min = 0.24  # Minimum allowed S value
 ###############################
 # Utility functions for discretization and action mapping
 ###############################
+
 
 def discretize_state(state, s_disc=S_DISCRETIZATION, i_disc=I_DISCRETIZATION):
     precision_s = len(str(s_disc).split(".")[-1])
@@ -124,26 +126,34 @@ def action_to_index(action):
 # Policy representation and saving
 ###############################
 
+
 def generate_full_policy(policy_table):
     precision_s = len(str(S_DISCRETIZATION).split(".")[-1])
     precision_i = len(str(I_DISCRETIZATION).split(".")[-1])
-    s_vals = np.round(np.arange(S_min, 1 + S_DISCRETIZATION, S_DISCRETIZATION), precision_s)
-    i_vals = np.round(np.arange(0, I_max + I_DISCRETIZATION, I_DISCRETIZATION), precision_i)
-    
+    s_vals = np.round(
+        np.arange(S_min, 1 + S_DISCRETIZATION, S_DISCRETIZATION), precision_s
+    )
+    i_vals = np.round(
+        np.arange(0, I_max + I_DISCRETIZATION, I_DISCRETIZATION), precision_i
+    )
+
     # Optional: Precompute string representations if needed.
     s_str = [str(val) for val in s_vals]
     i_str = [str(val) for val in i_vals]
-    
+
     # Precompute action mapping for all possible indices.
     action_cache = {i: index_to_action(i) for i in range(NUM_ACTIONS)}
-    
+
     # Use dictionary comprehension with itertools.product.
     full_policy = {
-        f"{s}:{s2}:{i}:{i2}".replace(":", ","): action_cache[policy_table.get(f'{s}:{s2}:{i}:{i2}'.replace(":", ","), 0)]
+        f"{s}:{s2}:{i}:{i2}".replace(":", ","): action_cache[
+            policy_table.get(f"{s}:{s2}:{i}:{i2}".replace(":", ","), 0)
+        ]
         for s, s2, i, i2 in product(s_str, s_str, i_str, i_str)
     }
-    
+
     return full_policy
+
 
 def save_policy(policy_table, filename):
     """
@@ -286,16 +296,25 @@ class SimulationEnv(gym.Env):
 
 class QNetwork(nn.Module):
     def __init__(
-        self, input_dim=4, output_dim=NUM_ACTIONS, hidden_dim=256, num_layers=6
+        self, state_dim=4, num_actions=NUM_ACTIONS, hidden_dim=256, num_layers=6
     ):
         super(QNetwork, self).__init__()
+        # NEW: Input dimension is state_dim + num_actions (one-hot for action)
+        input_dim = state_dim + num_actions
         layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
         for _ in range(num_layers - 1):
             layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
-        layers.append(nn.Linear(hidden_dim, output_dim))
+        # NEW: Output is a single scalar (Q-value)
+        layers.append(nn.Linear(hidden_dim, 1))
         self.model = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, state, action):
+        # NEW: Convert action (discrete index) into a one-hot vector and concatenate with state.
+        # Expecting state shape: (batch, state_dim), action shape: (batch,) or (batch,1)
+        if action.dim() == 2:
+            action = action.squeeze(1)
+        one_hot_action = F.one_hot(action, num_classes=NUM_ACTIONS).float()
+        x = torch.cat([state, one_hot_action], dim=1)
         return self.model(x)
 
 
@@ -324,8 +343,12 @@ class NNAgent:
 
         precision_s = len(str(S_DISCRETIZATION).split(".")[-1])
         precision_i = len(str(I_DISCRETIZATION).split(".")[-1])
-        s_vals = np.round(np.arange(S_min, 1 + S_DISCRETIZATION, S_DISCRETIZATION), precision_s)
-        i_vals = np.round(np.arange(0, I_max + I_DISCRETIZATION, I_DISCRETIZATION), precision_i)
+        s_vals = np.round(
+            np.arange(S_min, 1 + S_DISCRETIZATION, S_DISCRETIZATION), precision_s
+        )
+        i_vals = np.round(
+            np.arange(0, I_max + I_DISCRETIZATION, I_DISCRETIZATION), precision_i
+        )
         grid = np.array(np.meshgrid(s_vals, s_vals, i_vals, i_vals, indexing="ij"))
         self._states = grid.reshape(4, -1).T  # shape: (num_states, 4)
         self._keys = [f"{row[0]},{row[1]},{row[2]},{row[3]}" for row in self._states]
@@ -343,13 +366,7 @@ class NNAgent:
         self.update_counter = 0
 
     def update(self, trajectory, rewards):
-        """
-        Instead of per-transition updates, add all transitions from the trajectory
-        to the replay buffer and then perform several gradient descent steps on mini-batches.
-        Each transition is a tuple (s, a, r, s', done).
-        """
         T = len(trajectory)
-        # Add transitions from trajectory to replay buffer.
         for t in range(T):
             s, a = trajectory[t]
             r = rewards[t]
@@ -361,14 +378,11 @@ class NNAgent:
                 done = True
             self.replay_buffer.append((s, a, r, s_next, done))
 
-        # Only update if we have enough samples in the replay buffer.
         if len(self.replay_buffer) < self.batch_size:
             return
 
-        # Perform multiple gradient descent steps.
         for _ in range(self.update_steps):
             batch = random.sample(list(self.replay_buffer), self.batch_size)
-            # Unzip the mini-batch into its components.
             states, actions, rewards_batch, next_states, dones = zip(*batch)
 
             states_tensor = torch.tensor(np.array(states), dtype=torch.float32).to(
@@ -387,33 +401,40 @@ class NNAgent:
                 torch.tensor(dones, dtype=torch.float32).unsqueeze(1).to(device)
             )
 
-            # Compute Q(s, a) for the batch.
-            q_vals = self.net(states_tensor).gather(1, actions_tensor)
+            # NEW: Compute Q(s, a) using the state-action network
+            q_vals = self.net(states_tensor, actions_tensor)  # shape: (batch, 1)
 
-            # Double DQN target calculation:
+            # NEW: Compute target Q value using Double DQN style over all possible actions for next state.
             with torch.no_grad():
-                # Select the best action for the next state using the main network.
-                next_q_values_main = self.net(next_states_tensor)
-                next_actions = torch.argmax(next_q_values_main, dim=1, keepdim=True)
-                # Evaluate the selected action using the target network.
-                next_q_values_target = self.target_net(next_states_tensor).gather(
-                    1, next_actions
-                )
+                b = next_states_tensor.shape[0]
+                state_dim = next_states_tensor.shape[1]
+                # Expand next states for all candidate actions
+                next_states_expanded = next_states_tensor.unsqueeze(1).repeat(
+                    1, NUM_ACTIONS, 1
+                )  # shape (b, NUM_ACTIONS, state_dim)
+                candidate_actions = torch.arange(NUM_ACTIONS).to(device)
+                candidate_actions_expanded = candidate_actions.unsqueeze(0).repeat(
+                    b, 1
+                )  # shape (b, NUM_ACTIONS)
+                next_states_flat = next_states_expanded.reshape(-1, state_dim)
+                candidate_actions_flat = candidate_actions_expanded.reshape(-1)
+                q_next_flat = self.target_net(
+                    next_states_flat, candidate_actions_flat
+                )  # shape: (b*NUM_ACTIONS, 1)
+                q_next = q_next_flat.view(b, NUM_ACTIONS)  # shape: (b, NUM_ACTIONS)
+                next_q_values_target, _ = torch.max(q_next, dim=1, keepdim=True)
                 target = rewards_tensor + GAMMA * next_q_values_target * (
                     1 - dones_tensor
                 )
 
             loss = nn.MSELoss()(q_vals, target)
-
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
 
-            # Increment counter and update target network periodically.
             self.update_counter += 1
             if self.update_counter % self.target_update_freq == 0:
                 self.target_net.load_state_dict(self.net.state_dict())
-
                 torch.save(self.net.state_dict(), os.path.join(MODEL_DIR, "net.pth"))
                 torch.save(
                     self.target_net.state_dict(),
@@ -421,16 +442,27 @@ class NNAgent:
                 )
 
     def get_policy_table(self, eps):
-        # Vectorized computation over the precomputed state grid
         states_tensor = torch.tensor(self._states, dtype=torch.float32).to(device)
         with torch.no_grad():
-            q_vals = self.net(states_tensor)  # Forward pass for all states at once
-        best_actions = torch.argmax(q_vals, dim=1).cpu().numpy()
-        # Apply exploration: choose a random action with probability EPSILON[episode] per state
+            b = states_tensor.shape[0]
+            state_dim = states_tensor.shape[1]
+            states_expanded = states_tensor.unsqueeze(1).repeat(
+                1, NUM_ACTIONS, 1
+            )  # shape: (b, NUM_ACTIONS, state_dim)
+            candidate_actions = torch.arange(NUM_ACTIONS).to(device)
+            candidate_actions_expanded = candidate_actions.unsqueeze(0).repeat(
+                b, 1
+            )  # shape: (b, NUM_ACTIONS)
+            states_flat = states_expanded.reshape(-1, state_dim)
+            candidate_actions_flat = candidate_actions_expanded.reshape(-1)
+            q_values_flat = self.net(states_flat, candidate_actions_flat)
+            q_values = q_values_flat.view(b, NUM_ACTIONS)
+            best_actions = torch.argmax(q_values, dim=1).cpu().numpy()
+
+        # NEW: Apply exploration; override best actions with random actions with probability eps.
         rand_mask = np.random.rand(len(self._states)) < eps
         random_actions = np.random.randint(0, NUM_ACTIONS, size=len(self._states))
         final_actions = np.where(rand_mask, random_actions, best_actions)
-        # Create policy table mapping each state key to its chosen action
         policy_table = {
             key: int(action) for key, action in zip(self._keys, final_actions)
         }
@@ -474,7 +506,7 @@ def train():
     policy_table = {}
     losses = []
 
-    num_parallel = 10  # Number of parallel simulations per episode
+    num_parallel = 1  # Number of parallel simulations per episode
 
     for episode in range(NUM_EPISODES):
         logging.info("Starting Episode %d", episode)

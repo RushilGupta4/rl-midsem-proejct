@@ -6,6 +6,8 @@ abm
 *.png
 *.pth
 
+agentsim-julia/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
