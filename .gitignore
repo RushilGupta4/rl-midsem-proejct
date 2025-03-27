@@ -1,4 +1,5 @@
 *.toml
+!config.toml
 *.json
 abm
 *.csv
